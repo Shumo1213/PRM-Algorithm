@@ -1,0 +1,398 @@
+import math
+import numpy as np
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+from scipy.spatial import KDTree
+
+
+# 参数设置
+N_SAMPLE = 500  # 采样点数目,即随机点集V的大小
+N_KNN = 10  # 一个采样点的领域点个数
+MAX_EDGE_LEN = 30.0  # [m] 最大边长
+show_animation = True
+
+# Initial positions of the obstacles
+obstacle_x_list = [10, 20, 30, 40, 50]  # X positions
+obstacle_y_list = [45, 30, 20, 20, 10]  # Y positions
+obstacle_z_list = [30, 40, 20, 10, 50]  # Z positions
+# Velocities of the obstacles (vx, vy, vz) for each obstacle
+velocities = [(1, 1, 1), (-1, 1, -1), (1, -1, 1), (-1, -1, -1), (0, 2, 0)]
+# Define the boundary of the movement area
+x_min, x_max = 0, 60
+y_min, y_max = 0, 60
+z_min, z_max = 0, 60
+
+
+class Node:
+    """
+    用于Dijkstra搜索的节点类
+    """
+
+    def __init__(self, x, y, z, cost, parent_index):
+        self.x = x
+        self.y = y
+        self.z = z
+        self.cost = cost  # 每条边权值
+        self.parent_index = parent_index
+
+    def __str__(self):
+        return str(self.x) + "," + str(self.y) + "," + str(self.z) + "," + \
+            str(self.cost) + "," + str(self.parent_index)
+
+
+def prm_planning(start_x, start_y, start_z, goal_x, goal_y, goal_z,
+                 obstacle_x_list, obstacle_y_list, obstacle_z_list, robot_radius, *, rng=None):
+    """
+    运行概率路线图规划
+    :param start_x: 起点x位置
+    :param start_y: 起点y位置
+    :param start_z: 起点z位置
+    :param goal_x: 目标点x位置
+    :param goal_y: 目标点y位置
+    :param goal_z: 目标点z位置
+    :param obstacle_x_list: 障碍物x位置列表
+    :param obstacle_y_list: 障碍物y位置列表
+    :param obstacle_z_list: 障碍物z位置列表
+    :param robot_radius: 机器人半径
+    :param rng: 随机数构造器
+    :return:
+    """
+    obstacle_kd_tree = KDTree(np.vstack((obstacle_x_list, obstacle_y_list, obstacle_z_list)).T)
+    # 采样点集生成
+    sample_x, sample_y, sample_z = sample_points(start_x, start_y, start_z, goal_x, goal_y, goal_z,
+                                                 robot_radius,
+                                                 obstacle_x_list, obstacle_y_list, obstacle_z_list,
+                                                 obstacle_kd_tree, rng)
+    # if show_animation:
+    #     ax.scatter(sample_x, sample_y, sample_z, c='b', marker='.')
+
+    # 生成概率路图
+    road_map = generate_road_map(sample_x, sample_y, sample_z, robot_radius, obstacle_kd_tree)
+    # 使用迪杰斯特拉规划路径
+    rx, ry, rz = dijkstra_planning(
+        start_x, start_y, start_z, goal_x, goal_y, goal_z, road_map, sample_x, sample_y, sample_z)
+
+    return rx, ry, rz
+
+
+def is_collision(sx, sy, sz, gx, gy, gz, rr, obstacle_kd_tree):
+    """
+    判断是否发生碰撞,true碰撞,false不碰
+    rr: 机器人半径
+    """
+    x = sx
+    y = sy
+    z = sz
+    dx = gx - sx
+    dy = gy - sy
+    dz = gz - sz
+    d = math.sqrt(dx ** 2 + dy ** 2 + dz ** 2)
+
+    if d >= MAX_EDGE_LEN:
+        return True
+
+    n_step = round(d / rr)
+
+    for i in range(n_step):
+        dist, _ = obstacle_kd_tree.query([x, y, z])  # 查询kd-tree附近的邻居
+        if dist <= rr:
+            return True  # collision
+
+        x += dx / n_step
+        y += dy / n_step
+        z += dz / n_step
+
+    # 目标点检查
+    dist, _ = obstacle_kd_tree.query([gx, gy, gz])
+    if dist <= rr:
+        return True  # collision
+
+    return False  # OK
+
+
+def generate_road_map(sample_x, sample_y, sample_z, rr, obstacle_kd_tree):
+    """
+    概率路图生成
+
+    sample_x: [m] 采样点x坐标
+    sample_y: [m] 采样点y坐标
+    sample_z: [m] 采样点z坐标
+    robot_radius: 机器人半径[m]
+    obstacle_kd_tree: 障碍物的KDTree对象
+    """
+
+    road_map = []
+    n_sample = len(sample_x)
+    sample_kd_tree = KDTree(np.vstack((sample_x, sample_y, sample_z)).T)
+
+    for (i, ix, iy, iz) in zip(range(n_sample), sample_x, sample_y, sample_z):
+        # 对V中的每个点q,选择k个邻域点
+        dists, indexes = sample_kd_tree.query([ix, iy, iz], k=n_sample)
+        edge_id = []
+
+        for ii in range(1, len(indexes)):
+            nx = sample_x[indexes[ii]]
+            ny = sample_y[indexes[ii]]
+            nz = sample_z[indexes[ii]]
+            # 对每个领域点$q'$进行判断,如果$q$和$q'$尚未形成路径,则将其连接形成路径并进行碰撞检测,若无碰撞,则保留该路径。
+            if not is_collision(ix, iy, iz, nx, ny, nz, rr, obstacle_kd_tree):
+                edge_id.append(indexes[ii])
+
+            if len(edge_id) >= N_KNN:
+                break
+
+        road_map.append(edge_id)
+
+    return road_map
+
+
+def dijkstra_planning(sx, sy, sz, gx, gy, gz, road_map, sample_x, sample_y, sample_z):
+    """
+    s_x: 起点x位置 [m]
+    s_y: 起点y位置 [m]
+    s_z: 起点z位置 [m]
+    goal_x: 目标点x位置 [m]
+    goal_y: 目标点y位置 [m]
+    goal_z: 目标点z位置 [m]
+    obstacle_x_list: 障碍物x位置列表 [m]
+    obstacle_y_list: 障碍物y位置列表 [m]
+    obstacle_z_list: 障碍物z位置列表 [m]
+    robot_radius: 机器人半径 [m]
+    road_map: 构建好的路图 [m]
+    sample_x: 采样点集x [m]
+    sample_y: 采样点集y [m]
+    sample_z: 采样点集z [m]
+
+    @return: 路径坐标的三个列表 ([x1, x2, ...], [y1, y2, ...], [z1, z2, ...]),当没有找到路径时返回空列表
+    """
+
+    start_node = Node(sx, sy, sz, 0.0, -1)
+    goal_node = Node(gx, gy, gz, 0.0, -1)
+    # 使用字典的方式构造开闭集合
+    # openList表由待考察的节点组成, closeList表由已经考察过的节点组成。
+    open_set, closed_set = dict(), dict()
+    open_set[len(road_map) - 2] = start_node
+
+    path_found = True
+    # 步骤与A星算法一致
+    while True:
+        # 如果open_set是空的
+        if not open_set:
+            print("Cannot find path")
+            path_found = False
+            break
+
+        c_id = min(open_set, key=lambda o: open_set[o].cost)
+        current = open_set[c_id]
+
+        # 显示图形
+        if show_animation and len(closed_set.keys()) % 2 == 0:
+            # 使用esc键停止模拟
+            plt.gcf().canvas.mpl_connect(
+                'key_release_event',
+                lambda event: [exit(0) if event.key == 'escape' else None])
+            ax.plot([current.x], [current.y], [current.z], "xg")
+            plt.pause(0.001)
+
+        if c_id == (len(road_map) - 1):
+            print("goal is found!")
+            goal_node.parent_index = current.parent_index
+            goal_node.cost = current.cost
+            break
+
+        # 从开集中移除当前节点
+        del open_set[c_id]
+        # 将当前节点加入闭集
+        closed_set[c_id] = current
+
+        # 基于运动模型扩展搜索网格
+        for i in range(len(road_map[c_id])):
+            n_id = road_map[c_id][i]
+            dx = sample_x[n_id] - current.x
+            dy = sample_y[n_id] - current.y
+            dz = sample_z[n_id] - current.z
+            d = math.sqrt(dx ** 2 + dy ** 2 + dz ** 2)
+            node = Node(sample_x[n_id], sample_y[n_id], sample_z[n_id],
+                        current.cost + d, c_id)
+
+            if n_id in closed_set:
+                continue
+            # 如果节点已经在开集中
+            if n_id in open_set:
+                if open_set[n_id].cost > node.cost:
+                    open_set[n_id].cost = node.cost
+                    open_set[n_id].parent_index = c_id
+            else:
+                open_set[n_id] = node
+
+    if not path_found:
+        return [], [], []
+
+    # 生成最终路径
+    rx, ry, rz = [goal_node.x], [goal_node.y], [goal_node.z]
+    parent_index = goal_node.parent_index
+    while parent_index != -1:
+        n = closed_set[parent_index]
+        rx.append(n.x)
+        ry.append(n.y)
+        rz.append(n.z)
+        parent_index = n.parent_index
+
+    return rx, ry, rz
+
+
+def sample_points(sx, sy, sz, gx, gy, gz, rr, ox, oy, oz, obstacle_kd_tree, rng):
+    """采样点集生成
+    """
+    max_x = max(gx, sx)
+    max_y = max(gy, sy)
+    max_z = max(gz, sz)
+    min_x = min(gx, sx)
+    min_y = min(gy, sy)
+    min_z = min(gz, sz)
+
+    sample_x, sample_y, sample_z = [], [], []
+
+    if rng is None:
+        rng = np.random.default_rng()
+
+    while len(sample_x) <= N_SAMPLE:
+        tx = (rng.random() * (max_x - min_x)) + min_x
+        ty = (rng.random() * (max_y - min_y)) + min_y
+        tz = (rng.random() * (max_z - min_z)) + min_z
+
+        # 在障碍物中查询离[tx, ty, tz]最近的点的距离
+        dist, index = obstacle_kd_tree.query([tx, ty, tz])
+
+        # 距离大于机器人半径,说明没有碰撞,将这个无碰撞的点加入V中,重复n次。
+        if dist >= rr:
+            sample_x.append(tx)
+            sample_y.append(ty)
+            sample_z.append(tz)
+    # 别忘了起点和目标点
+    sample_x.append(sx)
+    sample_y.append(sy)
+    sample_z.append(sz)
+    sample_x.append(gx)
+    sample_y.append(gy)
+    sample_z.append(gz)
+
+    return sample_x, sample_y, sample_z
+
+
+# Function to simulate movement with boundary conditions
+def simulate_movement_with_boundaries(obstacle_x_list, obstacle_y_list, obstacle_z_list, velocities, dt=1.0):
+    positions = {'x': obstacle_x_list.copy(), 'y': obstacle_y_list.copy(), 'z': obstacle_z_list.copy()}
+    velocities = [[vx, vy, vz] for vx, vy, vz in velocities]
+
+    while True:
+        updated_x_list, updated_y_list, updated_z_list = [], [], []
+        for index, (x, y, z) in enumerate(zip(positions['x'], positions['y'], positions['z'])):
+            vx, vy, vz = velocities[index]
+            new_x = x + vx * dt
+            new_y = y + vy * dt
+            new_z = z + vz * dt
+
+            if new_x <= x_min or new_x >= x_max:
+                vx *= -1  # Reverse x velocity
+            if new_y <= y_min or new_y >= y_max:
+                vy *= -1  # Reverse y velocity
+            if new_z <= z_min or new_z >= z_max:
+                vz *= -1  # Reverse z velocity
+
+            updated_x_list.append(new_x)
+            updated_y_list.append(new_y)
+            updated_z_list.append(new_z)
+            velocities[index] = [vx, vy, vz]
+
+        positions['x'] = updated_x_list
+        positions['y'] = updated_y_list
+        positions['z'] = updated_z_list
+        yield positions
+
+
+# ... (保持其他代码不变)
+def main(rng=None):
+    print("start!!")
+    global ax
+    fig = plt.figure(figsize=(10, 10))
+    ax = fig.add_subplot(111, projection='3d')
+
+    # 起点和目标位置
+    sx = 10.0  # [m]
+    sy = 10.0  # [m]
+    sz = 10.0  # [m]
+    gx = 50.0  # [m]
+    gy = 50.0  # [m]
+    gz = 50.0  # [m]
+    robot_size = 5.0  # [m]
+    if show_animation:
+        ax.set_xlim3d(0, 60)
+        ax.set_ylim3d(0, 60)
+        ax.set_zlim3d(0, 60)
+        ax.set_title('PRM* with Dynamic Obstacles (3D)')
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+        ax.set_zlabel('Z')
+        ax.grid(True)
+
+        ax.scatter([sx], [sy], [sz], c='r', marker='^')
+        ax.scatter([gx], [gy], [gz], c='b', marker='^')
+
+        # 初始散点图
+        scat = ax.scatter(obstacle_x_list, obstacle_y_list, obstacle_z_list, c='black', label='Obstacles')
+
+        # 存储箭头对象的列表
+        arrows = []
+
+        # 绘制箭头指示障碍物的运动方向
+        for i in range(len(obstacle_x_list)):
+            arrow = ax.quiver(obstacle_x_list[i], obstacle_y_list[i], obstacle_z_list[i],
+                              velocities[i][0], velocities[i][1], velocities[i][2],
+                              color='red', arrow_length_ratio=0.5, length=3.0)
+            arrows.append(arrow)
+
+        plt.pause(10)
+
+    # 存储所有路线图的线条对象和颜色的列表
+    path_lines = []
+    path_colors = ['r', 'g', 'b', 'm', 'y', 'c']  # 定义不同的颜色列表
+
+    # 模拟动态障碍物的运动
+    for i, positions in enumerate(
+            simulate_movement_with_boundaries(obstacle_x_list, obstacle_y_list, obstacle_z_list, velocities)):
+        # 更新动态障碍物的位置
+        ox = positions['x']
+        oy = positions['y']
+        oz = positions['z']
+
+        scat._offsets3d = (ox, oy, oz)
+
+        # 清除之前的箭头
+        for arrow in arrows:
+            arrow.remove()
+        arrows.clear()
+
+        # 绘制新的箭头指示障碍物的运动方向
+        for j in range(len(ox)):
+            arrow = ax.quiver(ox[j], oy[j], oz[j],
+                              velocities[j][0], velocities[j][1], velocities[j][2],
+                              color='red', arrow_length_ratio=0.5, length=3.0)
+            arrows.append(arrow)
+
+        # 执行PRM算法
+        rx, ry, rz = prm_planning(sx, sy, sz, gx, gy, gz, ox, oy, oz, robot_size, rng=rng)
+
+        plt.pause(10)
+        if show_animation:
+            if len(rx) > 0 and len(ry) > 0 and len(rz) > 0:
+                # 为每次采样生成的新路径分配不同的颜色
+                color = path_colors[i % len(path_colors)]
+                line = ax.plot(rx, ry, rz, color=color, linewidth=2)
+                path_lines.append(line[0])
+            plt.pause(10)
+
+    plt.show()
+
+if __name__ == '__main__':
+    main()
